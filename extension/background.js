@@ -378,7 +378,11 @@ const commands = {
       else if (action === 'reload') await chrome.tabs.reload(tabId);
       else await chrome.tabs.update(tabId, { url });
     });
-    return { ...tabInfo(await chrome.tabs.get(tabId)), note: dialogNote(dialogs) };
+    const t = await chrome.tabs.get(tabId);
+    let note = dialogNote(dialogs);
+    // Don't report a hung load as success: say so if the page is still loading.
+    if (t.status === 'loading') note += '\n(note: the page was still loading when the wait ended)';
+    return { ...tabInfo(t), note };
   },
 
   async snapshot({ tabId, selector, interactiveOnly, maxChars = 30000 }) {
