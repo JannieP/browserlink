@@ -211,6 +211,18 @@ async function onTab(args, method, params = {}, timeoutMs) {
   return { s, tabId, result, handle: `${s.name}:${tabId}` };
 }
 
+// Resolve caller-supplied upload paths to absolute paths that exist on this
+// machine (where Chrome runs). "~" is expanded. Throws on a missing file.
+function resolveLocalFiles(files) {
+  return files.map(f => {
+    let p = f;
+    if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
+    p = path.resolve(p);
+    if (!fs.existsSync(p)) throw new Error(`file not found: ${f}`);
+    return p;
+  });
+}
+
 function buildMcp() {
   const mcp = new McpServer({ name: 'browserlink', version: '0.1.0' });
 
@@ -291,7 +303,7 @@ function buildMcp() {
   }, async args => {
     if (!args.url && !args.action) throw new Error('pass url or action');
     const r = await onTab(args, 'navigate', { url: args.url, action: args.action }, 30000);
-    return text(`${r.handle} — ${r.result.title} — ${r.result.url}`);
+    return text(`${r.handle} — ${r.result.title} — ${r.result.url}${r.result.note || ''}`);
   });
 
   tool(mcp, 'snapshot', 'Read the page as an indented outline of text, headings and controls. Each control has a ref like [e12] to use with click/type/etc. Refs stay valid until the element leaves the page. Prefer this over screenshots for reading and acting.', {
@@ -389,6 +401,36 @@ function buildMcp() {
     if (!args.text && !args.selector) throw new Error('pass text or selector');
     const t = args.timeout_ms ?? 10000;
     return text((await onTab(args, 'waitFor', { text: args.text, selector: args.selector, gone: args.gone, timeoutMs: t }, t + 5000)).result);
+  });
+
+  tool(mcp, 'file_upload', 'Attach local file(s) to a file input (an <input type="file">), chosen by ref, selector or visible text. Give absolute paths on this machine ("~" is allowed). Replaces any current selection. Use this instead of clicking the input, which would open the OS file picker.', {
+    tab: tabArg, session: sessionArg, ...targetArgs,
+    files: z.array(z.string()).min(1).describe('Absolute local file paths. Pass more than one only if the input allows multiple.'),
+  }, async args => {
+    const files = resolveLocalFiles(args.files);
+    return text((await onTab(args, 'fileUpload', { ...pick(args, 'ref', 'selector', 'text'), files }, 30000)).result);
+  });
+
+  tool(mcp, 'handle_dialog', 'Control how JavaScript dialogs (alert/confirm/prompt) and "leave site?" (beforeunload) prompts are answered on a tab, and read recent ones. By default BrowserLink auto-answers them so they never block automation: alert is acknowledged, confirm and prompt are cancelled, and beforeunload is suppressed. Set accept=true (optionally with prompt_text) before an action when you want to confirm or fill a prompt.', {
+    tab: tabArg, session: sessionArg,
+    accept: z.boolean().optional().describe('Answer confirm/prompt with OK (true) or Cancel (false).'),
+    prompt_text: z.string().optional().describe('Text to return from prompt() when accepting.'),
+    scope: z.enum(['next', 'always']).optional().describe('Apply to only the next dialog, or until changed (default always).'),
+    suppress_beforeunload: z.boolean().optional().describe('Suppress "leave site?" prompts (default true).'),
+    read: z.boolean().optional().describe('Also return recent dialogs seen on this tab.'),
+    clear: z.boolean().optional().describe('Clear the dialog history after reading.'),
+  }, async args => {
+    const { result } = await onTab(args, 'dialog', {
+      accept: args.accept, promptText: args.prompt_text, suppressBeforeunload: args.suppress_beforeunload,
+      scope: args.scope, read: args.read, clear: args.clear,
+    });
+    const p = result.policy;
+    const lines = [];
+    if (p) lines.push(`policy: confirm/prompt ${p.accept ? 'ACCEPT' : 'dismiss'}${p.promptText != null ? ` (prompt text "${p.promptText}")` : ''}, beforeunload ${p.suppressBeforeunload ? 'suppressed' : 'shown'}`);
+    if (args.read) lines.push(result.dialogs.length
+      ? 'recent dialogs:\n' + result.dialogs.map(d => `  ${new Date(d.t).toISOString().slice(11, 19)} ${d.answered} ${d.type}${d.type !== 'beforeunload' && d.message ? ` "${d.message.slice(0, 140)}"` : ''}`).join('\n')
+      : 'recent dialogs: none');
+    return text(lines.join('\n') || 'ok');
   });
 
   return mcp;

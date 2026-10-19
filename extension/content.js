@@ -379,6 +379,17 @@
       if (a.clear) { if (el.isContentEditable) document.execCommand('selectAll'); else el.select?.(); }
       return describe(el); },
     describe: a => describe(resolve(a)),
+    // Tag a file input with a unique attribute so the debugger can find it by
+    // selector and call DOM.setFileInputFiles on it. Returns that selector.
+    markForUpload: a => {
+      const el = resolve(a);
+      if (!(el.tagName === 'INPUT' && el.type === 'file')) throw new Error(`${describe(el)} is not a file input`);
+      const token = 'u' + Math.random().toString(36).slice(2, 10);
+      el.setAttribute('data-bl-upload', token);
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      return { selector: `input[data-bl-upload="${token}"]`, multiple: !!el.multiple, desc: describe(el) };
+    },
+    unmarkUpload: a => { document.querySelector(a.selector)?.removeAttribute('data-bl-upload'); return 'ok'; },
   };
 
   Object.defineProperty(window, '__browserlink', {

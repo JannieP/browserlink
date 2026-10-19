@@ -158,11 +158,95 @@ async function pageState(tabId) {
   return `${t.title} — ${t.url}`;
 }
 
-// After an action that may navigate, give the page a moment and wait out any load it triggered.
-async function settle(tabId) {
-  await sleep(250);
-  const t = await chrome.tabs.get(tabId);
-  if (t.status === 'loading') await waitForLoad(tabId, 10000);
+// Watch chrome.webNavigation for a navigation on the top frame of this tab,
+// started by whatever we are about to do. SPA route changes (history API,
+// hash) fire onHistoryStateUpdated / onReferenceFragmentUpdated and count too.
+// Falls back to tab-status polling if the webNavigation permission is absent.
+function armNav(tabId) {
+  if (!chrome.webNavigation) {
+    return { async wait(timeoutMs = 10000) {
+      await sleep(250);
+      const t = await chrome.tabs.get(tabId).catch(() => null);
+      if (t?.status === 'loading') await waitForLoad(tabId, timeoutMs);
+    } };
+  }
+  let navigated = false, completed = false, resolveDone;
+  const doneP = new Promise(r => (resolveDone = r));
+  const top = d => d.tabId === tabId && d.frameId === 0;
+  const onCommitted = d => { if (top(d)) navigated = true; };
+  const onSpa = d => { if (top(d)) { navigated = true; completed = true; resolveDone(); } };
+  const onDone = d => { if (top(d)) { completed = true; resolveDone(); } };
+  const wn = chrome.webNavigation;
+  wn.onCommitted.addListener(onCommitted);
+  wn.onHistoryStateUpdated.addListener(onSpa);
+  wn.onReferenceFragmentUpdated.addListener(onSpa);
+  wn.onCompleted.addListener(onDone);
+  wn.onErrorOccurred.addListener(onDone);
+  const cleanup = () => {
+    wn.onCommitted.removeListener(onCommitted);
+    wn.onHistoryStateUpdated.removeListener(onSpa);
+    wn.onReferenceFragmentUpdated.removeListener(onSpa);
+    wn.onCompleted.removeListener(onDone);
+    wn.onErrorOccurred.removeListener(onDone);
+  };
+  return {
+    async wait(timeoutMs = 15000) {
+      await sleep(150); // give a navigation a chance to begin
+      if (navigated && !completed) await Promise.race([doneP, sleep(timeoutMs)]);
+      cleanup();
+    },
+  };
+}
+
+// Ask the page (MAIN world) to wait until the document is loaded and fetch/XHR
+// have been quiet for a moment. Best-effort: skipped on pages we cannot script.
+async function waitQuiet(tabId, opts = { quietMs: 400, timeoutMs: 8000 }) {
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId }, world: 'MAIN',
+      func: o => (window.__browserlinkCapture ? window.__browserlinkCapture.settled(o) : 'no-capture'),
+      args: [opts],
+    });
+    return r?.result;
+  } catch { return 'skip'; }
+}
+
+// Collect any JS dialogs that fired since the last drain, across all frames.
+async function drainDialogs(tabId) {
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, world: 'MAIN',
+      func: () => (window.__browserlinkCapture?.drainFresh?.() || []),
+    });
+    return res.flatMap(r => r.result || []);
+  } catch { return []; }
+}
+
+function dialogNote(dialogs) {
+  if (!dialogs?.length) return '';
+  const lines = dialogs.map(d => `dialog: auto-${d.answered} ${d.type}` +
+    (d.type !== 'beforeunload' && d.message ? ` "${d.message.slice(0, 140)}"` : ''));
+  if (dialogs.some(d => d.answered === 'dismissed'))
+    lines.push('(use handle_dialog with accept=true before the action to allow these)');
+  return '\n' + lines.join('\n');
+}
+
+// Run an action, wait out any navigation it triggers and the network going
+// quiet, and surface any JS dialogs that fired during it (including on error,
+// since a dialog is often why an action "failed").
+async function act(tabId, doAction) {
+  const nav = armNav(tabId);
+  let out, err;
+  try { out = await doAction(); }
+  catch (e) { err = e; }
+  await nav.wait();
+  await waitQuiet(tabId);
+  const dialogs = await drainDialogs(tabId);
+  if (err) {
+    const note = dialogNote(dialogs);
+    throw note ? new Error(String(err?.message || err) + note) : err;
+  }
+  return { out, dialogs };
 }
 
 // ---------- chrome.debugger (trusted input, background screenshots, eval fallback) ----------
@@ -288,11 +372,13 @@ const commands = {
   },
 
   async navigate({ tabId, url, action }) {
-    if (action === 'back') await chrome.tabs.goBack(tabId);
-    else if (action === 'forward') await chrome.tabs.goForward(tabId);
-    else if (action === 'reload') await chrome.tabs.reload(tabId);
-    else await chrome.tabs.update(tabId, { url });
-    return tabInfo(await waitForLoad(tabId));
+    const { dialogs } = await act(tabId, async () => {
+      if (action === 'back') await chrome.tabs.goBack(tabId);
+      else if (action === 'forward') await chrome.tabs.goForward(tabId);
+      else if (action === 'reload') await chrome.tabs.reload(tabId);
+      else await chrome.tabs.update(tabId, { url });
+    });
+    return { ...tabInfo(await chrome.tabs.get(tabId)), note: dialogNote(dialogs) };
   },
 
   async snapshot({ tabId, selector, interactiveOnly, maxChars = 30000 }) {
@@ -311,36 +397,38 @@ const commands = {
   },
 
   async click({ tabId, trusted, double, button, ...p }) {
-    const desc = trusted ? await trustedClick(tabId, { ...p, double, button })
-      : await runOne(tabId, 'click', { ...targetArgs(p).args, double, button }, targetArgs(p).frameId);
-    await settle(tabId);
-    return `clicked ${desc}\npage: ${await pageState(tabId)}`;
+    const { frameId, args } = targetArgs(p);
+    const { out, dialogs } = await act(tabId, () => trusted
+      ? trustedClick(tabId, { ...p, double, button })
+      : runOne(tabId, 'click', { ...args, double, button }, frameId));
+    return `clicked ${out}${dialogNote(dialogs)}\npage: ${await pageState(tabId)}`;
   },
 
   async type({ tabId, value, clear = true, submit = false, trusted, ...p }) {
     const { frameId, args } = targetArgs(p);
-    let desc;
-    if (trusted) {
-      desc = await runOne(tabId, 'focus', { ...args, clear }, frameId);
-      await cdp(tabId, 'Input.insertText', { text: value });
-      if (submit) await trustedKey(tabId, 'Enter');
-    } else desc = await runOne(tabId, 'type', { ...args, value, clear, submit }, frameId);
-    await settle(tabId);
-    return `typed into ${desc}\npage: ${await pageState(tabId)}`;
+    const { out, dialogs } = await act(tabId, async () => {
+      if (trusted) {
+        const desc = await runOne(tabId, 'focus', { ...args, clear }, frameId);
+        await cdp(tabId, 'Input.insertText', { text: value });
+        if (submit) await trustedKey(tabId, 'Enter');
+        return desc;
+      }
+      return runOne(tabId, 'type', { ...args, value, clear, submit }, frameId);
+    });
+    return `typed into ${out}${dialogNote(dialogs)}\npage: ${await pageState(tabId)}`;
   },
 
   async press({ tabId, key, trusted, ...p }) {
-    let out;
-    if (trusted) {
-      if (p.ref || p.selector || p.text) { const { frameId, args } = targetArgs(p); await runOne(tabId, 'focus', args, frameId); }
-      await trustedKey(tabId, key);
-      out = `pressed ${key}`;
-    } else {
+    const { out, dialogs } = await act(tabId, async () => {
+      if (trusted) {
+        if (p.ref || p.selector || p.text) { const { frameId, args } = targetArgs(p); await runOne(tabId, 'focus', args, frameId); }
+        await trustedKey(tabId, key);
+        return `pressed ${key}`;
+      }
       const { frameId, args } = p.ref || p.selector || p.text ? targetArgs(p) : { frameId: 0, args: {} };
-      out = await runOne(tabId, 'press', { ...args, key }, frameId);
-    }
-    await settle(tabId);
-    return `${out}\npage: ${await pageState(tabId)}`;
+      return runOne(tabId, 'press', { ...args, key }, frameId);
+    });
+    return `${out}${dialogNote(dialogs)}\npage: ${await pageState(tabId)}`;
   },
 
   async select({ tabId, values, ...p }) {
@@ -395,6 +483,47 @@ const commands = {
       })),
     });
     return r.result;
+  },
+
+  async fileUpload({ tabId, files, ...p }) {
+    const { frameId, args } = targetArgs(p);
+    if (frameId !== 0) throw new Error('file upload currently works only in the top frame');
+    const tab = await chrome.tabs.get(tabId);
+    if (restricted(tab.url)) throw new Error(`Chrome does not let extensions script ${tab.url}`);
+    await ensureAgent(tabId);
+    const { selector, desc } = await runOne(tabId, 'markForUpload', args, 0);
+    try {
+      await cdp(tabId, 'DOM.enable');
+      const doc = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
+      const { nodeId } = await cdp(tabId, 'DOM.querySelector', { nodeId: doc.root.nodeId, selector });
+      if (!nodeId) throw new Error('could not locate the file input via the debugger');
+      await cdp(tabId, 'DOM.setFileInputFiles', { nodeId, files });
+    } finally {
+      await runOne(tabId, 'unmarkUpload', { selector }, 0).catch(() => {});
+    }
+    const { dialogs } = await act(tabId, async () => {});
+    return `attached ${files.length} file(s) to ${desc}${dialogNote(dialogs)}\npage: ${await pageState(tabId)}`;
+  },
+
+  async dialog({ tabId, accept, promptText, suppressBeforeunload, scope, read = false, clear = false }) {
+    const policy = {};
+    if (accept !== undefined) policy.accept = accept;
+    if (promptText !== undefined) policy.promptText = promptText;
+    if (suppressBeforeunload !== undefined) policy.suppressBeforeunload = suppressBeforeunload;
+    if (scope !== undefined) policy.scope = scope;
+    const res = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, world: 'MAIN',
+      func: (policy, read, clear) => {
+        const c = window.__browserlinkCapture;
+        if (!c) return null;
+        const p = c.setDialogPolicy(policy);
+        return { policy: p.policy, dialogs: read ? c.dialogs(clear) : [] };
+      },
+      args: [policy, read, clear],
+    });
+    const top = res.find(r => r.frameId === 0)?.result || res.map(r => r.result).find(Boolean);
+    if (!top) throw new Error('this page cannot be scripted, so dialogs cannot be controlled here');
+    return top;
   },
 
   async setName({ name }) {
