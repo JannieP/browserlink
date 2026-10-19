@@ -12,10 +12,10 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod';
 
 const PORT = Number(process.env.BROWSERLINK_PORT || 47821);
-const CONFIG_DIR = path.join(os.homedir(), '.config', 'browserlink');
+const CONFIG_DIR = process.env.BROWSERLINK_CONFIG_DIR || path.join(os.homedir(), '.config', 'browserlink');
 const TOKEN_FILE = path.join(CONFIG_DIR, 'token');
 const REGISTRY_FILE = path.join(CONFIG_DIR, 'sessions.json');
-const CHROME_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
+const CHROME_DIR = process.env.BROWSERLINK_CHROME_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome');
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -52,9 +52,27 @@ const NAME_RE = /^[A-Za-z0-9][\w.-]{0,39}$/;
 /** instanceId -> { ws, info, name, conflict, pending: Map, lastFocusAt } */
 const sessions = new Map();
 
+// Bounded diagnostic log of browser commands. Records shape and outcome only —
+// no URLs, inputs, code or page content — so it is safe to keep and expose.
+const journal = [];
+let seq = 0;
+const MAX_JOURNAL = 500;
+function journalAdd(e) { journal.push(e); if (journal.length > MAX_JOURNAL) journal.shift(); }
+
+// Settle every outstanding call on a session (reconnect, disconnect) instead of
+// leaving them to time out, and record the uncertain outcome.
+function rejectPending(sess, reason) {
+  for (const p of sess.pending.values()) {
+    clearTimeout(p.timer);
+    if (p.journal && p.journal.outcome === 'sent') { p.journal.outcome = reason; p.journal.ms = Date.now() - p.journal.t; }
+    p.reject(new Error(`${sess.name || sess.info?.instanceId || 'session'} ${reason}; the browser action's completion is unknown`));
+  }
+  sess.pending.clear();
+}
+
 function findByName(name) {
   const want = name.toLowerCase();
-  for (const s of sessions.values()) if (s.name.toLowerCase() === want) return s;
+  for (const s of sessions.values()) if (s.name && s.name.toLowerCase() === want) return s;
   return null;
 }
 
@@ -75,9 +93,23 @@ function assignName(s) {
 
 function call(s, method, params = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
+    const entry = { seq: ++seq, t: Date.now(), session: s.name, tab: params.tabId ?? null, method, outcome: 'sent', ms: null };
+    journalAdd(entry);
+    if (!s.ws || s.ws.readyState !== 1) { // 1 = WebSocket.OPEN
+      entry.outcome = 'not-sent'; entry.ms = 0;
+      return reject(new Error(`session ${s.name} is not connected`));
+    }
     const id = crypto.randomUUID();
-    const timer = setTimeout(() => { s.pending.delete(id); reject(new Error(`${method} timed out after ${timeoutMs}ms`)); }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer });
+    const timer = setTimeout(() => {
+      s.pending.delete(id);
+      entry.outcome = 'timeout-unknown'; entry.ms = Date.now() - entry.t;
+      reject(new Error(`${method} timed out after ${timeoutMs}ms; the browser action may or may not have completed`));
+    }, timeoutMs);
+    s.pending.set(id, {
+      resolve: v => { entry.outcome = 'completed'; entry.ms = Date.now() - entry.t; resolve(v); },
+      reject: e => { if (entry.outcome === 'sent') { entry.outcome = 'failed'; entry.ms = Date.now() - entry.t; } reject(e); },
+      timer, journal: entry,
+    });
     s.ws.send(JSON.stringify({ type: 'call', id, method, params }));
   });
 }
@@ -102,11 +134,14 @@ async function resolveTab(tab, session) {
   if (tab) {
     const id = Number(tab);
     const candidates = session ? [sessionFor(session)] : [...sessions.values()];
+    const matches = [];
     for (const s of candidates) {
       const { tabs } = await call(s, 'tabs');
-      if (tabs.some(t => t.id === id)) return { s, tabId: id };
+      if (tabs.some(t => t.id === id)) matches.push(s);
     }
-    throw new Error(`tab ${tab} not found`);
+    if (matches.length === 0) throw new Error(`tab ${tab} not found`);
+    if (matches.length > 1) throw new Error(`tab id ${id} exists in ${matches.length} sessions (${matches.map(s => s.name).join(', ')}); use a "session:tab" handle such as "${matches[0].name}:${id}"`);
+    return { s: matches[0], tabId: id };
   }
   const s = sessionFor(session);
   const { tabs, focusedWindowId } = await call(s, 'tabs');
@@ -119,34 +154,46 @@ async function resolveTab(tab, session) {
 
 const LOCAL_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`, `[::1]:${PORT}`]);
 
-const server = http.createServer(async (req, res) => {
-  // Reject DNS-rebinding and browser-originated requests outright.
-  if (!LOCAL_HOSTS.has(req.headers.host) || (req.headers.origin && req.headers.origin !== EXT_ORIGIN)) {
-    res.writeHead(403).end('forbidden');
-    return;
-  }
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' })
-      .end(JSON.stringify({ ok: true, sessions: [...sessions.values()].map(s => s.name) }));
-    return;
-  }
-  if (url.pathname !== '/mcp') { res.writeHead(404).end(); return; }
-  const auth = req.headers.authorization || '';
-  const given = Buffer.from(auth.replace(/^Bearer\s+/i, ''));
-  const want = Buffer.from(TOKEN);
-  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) { res.writeHead(401).end('bad token'); return; }
+const MAX_BODY = 4 * 1024 * 1024;
 
-  if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }).end(); return; }
-  let body = '';
-  for await (const chunk of req) body += chunk;
-  let parsed;
-  try { parsed = JSON.parse(body); } catch { res.writeHead(400).end('bad json'); return; }
-  const mcp = buildMcp();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-  res.on('close', () => { transport.close(); mcp.close(); });
-  await mcp.connect(transport);
-  await transport.handleRequest(req, res, parsed);
+const server = http.createServer(async (req, res) => {
+  try {
+    // Reject DNS-rebinding and browser-originated requests outright.
+    if (!LOCAL_HOSTS.has(req.headers.host) || (req.headers.origin && req.headers.origin !== EXT_ORIGIN)) {
+      res.writeHead(403).end('forbidden');
+      return;
+    }
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === '/health') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ ok: true, sessions: [...sessions.values()].map(s => s.name) }));
+      return;
+    }
+    if (url.pathname !== '/mcp') { res.writeHead(404).end(); return; }
+    const auth = req.headers.authorization || '';
+    const given = Buffer.from(auth.replace(/^Bearer\s+/i, ''));
+    const want = Buffer.from(TOKEN);
+    if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) { res.writeHead(401).end('bad token'); return; }
+
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }).end(); return; }
+    let body = '', size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > MAX_BODY) { res.writeHead(413).end('request body too large'); req.destroy(); return; }
+      body += chunk;
+    }
+    let parsed;
+    try { parsed = JSON.parse(body); } catch { res.writeHead(400).end('bad json'); return; }
+    const mcp = buildMcp();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    res.on('close', () => { transport.close(); mcp.close(); });
+    await mcp.connect(transport);
+    await transport.handleRequest(req, res, parsed);
+  } catch (e) {
+    log('request error:', e?.message || e);
+    if (!res.headersSent) res.writeHead(500).end('internal error');
+    else try { res.end(); } catch { /* already closed */ }
+  }
 });
 
 const wss = new WebSocketServer({
@@ -160,28 +207,36 @@ wss.on('connection', ws => {
   ws.on('message', raw => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-    if (msg.type === 'hello') {
-      const old = sessions.get(msg.instanceId);
-      if (old && old.ws !== ws) old.ws.terminate();
-      s = { ws, info: msg, pending: new Map(), lastFocusAt: msg.lastFocusAt || 0, connectedAt: Date.now() };
-      sessions.set(msg.instanceId, s);
-      assignName(s);
-      log(`connected ${s.name} (${msg.email || 'no email'}, ${msg.instanceId})${s.conflict ? ' — ' + s.conflict : ''}`);
-    } else if (!s) return;
-    else if (msg.type === 'result') {
-      const p = s.pending.get(msg.id);
-      if (!p) return;
-      s.pending.delete(msg.id);
-      clearTimeout(p.timer);
-      msg.error ? p.reject(new Error(msg.error)) : p.resolve(msg.result);
-    } else if (msg.type === 'focus') s.lastFocusAt = msg.at;
+    if (!msg || typeof msg !== 'object') return;
+    try {
+      if (msg.type === 'hello') {
+        if (typeof msg.instanceId !== 'string' || !msg.instanceId) { ws.close(1008, 'bad hello'); return; }
+        msg.email = typeof msg.email === 'string' ? msg.email : '';
+        if (s && s.ws === ws) { s.info = msg; assignName(s); return; } // second hello on the same socket: identity update
+        const old = sessions.get(msg.instanceId);
+        if (old && old.ws !== ws) { rejectPending(old, 'was replaced by a new connection'); try { old.ws.terminate(); } catch {} }
+        s = { ws, info: msg, pending: new Map(), lastFocusAt: msg.lastFocusAt || 0, connectedAt: Date.now() };
+        assignName(s); // assign the name before registering, so findByName's conflict check ignores this session
+        sessions.set(msg.instanceId, s);
+        log(`connected ${s.name} (${msg.email || 'no email'}, ${msg.instanceId})${s.conflict ? ' — ' + s.conflict : ''}`);
+      } else if (!s) return;
+      else if (msg.type === 'result') {
+        if (typeof msg.id !== 'string') return;
+        const p = s.pending.get(msg.id);
+        if (!p) return;
+        s.pending.delete(msg.id);
+        clearTimeout(p.timer);
+        msg.error ? p.reject(new Error(String(msg.error))) : p.resolve(msg.result);
+      } else if (msg.type === 'focus') s.lastFocusAt = Number(msg.at) || s.lastFocusAt;
+    } catch (e) { log('ws message error:', e?.message || e); }
   });
   ws.on('close', () => {
     if (!s || sessions.get(s.info.instanceId) !== s) return;
     sessions.delete(s.info.instanceId);
-    for (const p of s.pending.values()) { clearTimeout(p.timer); p.reject(new Error(`session ${s.name} disconnected`)); }
+    rejectPending(s, 'disconnected');
     log(`disconnected ${s.name}`);
   });
+  ws.on('error', () => { try { ws.terminate(); } catch { /* already down */ } });
 });
 
 // ---------- MCP tools ----------
@@ -431,6 +486,17 @@ function buildMcp() {
       ? 'recent dialogs:\n' + result.dialogs.map(d => `  ${new Date(d.t).toISOString().slice(11, 19)} ${d.answered} ${d.type}${d.type !== 'beforeunload' && d.message ? ` "${d.message.slice(0, 140)}"` : ''}`).join('\n')
       : 'recent dialogs: none');
     return text(lines.join('\n') || 'ok');
+  });
+
+  tool(mcp, 'activity', 'Recent browser commands the hub has run, newest last: time, session, tab, method, outcome and latency. Outcomes: sent, completed, failed, timeout-unknown (dispatched but no reply before the deadline, so it may still have happened), not-sent, disconnected. A diagnostic log that records no URLs, inputs, code or page content.', {
+    limit: z.number().optional().describe('How many recent entries to show (default 50)'),
+    clear: z.boolean().optional().describe('Clear the log after reading'),
+  }, async ({ limit = 50, clear = false }) => {
+    const rows = journal.slice(-limit).map(e =>
+      `${new Date(e.t).toISOString().slice(11, 23)} ${String(e.session || '?').padEnd(14)} tab=${e.tab ?? '-'} ${String(e.method).padEnd(11)} ${e.outcome}${e.ms != null ? ` ${e.ms}ms` : ''}`);
+    const out = rows.join('\n') || '(no activity yet)';
+    if (clear) journal.length = 0;
+    return text(out);
   });
 
   return mcp;
