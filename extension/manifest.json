@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "BrowserLink",
+  "version": "0.1.0",
+  "description": "Lets local agents (Claude Code) read and drive this browser profile through the BrowserLink hub on 127.0.0.1.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsk+pIwHLE+Md14maqT3ztM0khuq6fAdbfyy4vNcng4Obpik1zcH7QEVlvIeobSehn6rNq59YMEL1udr2eBYJ+q7nbxajTgQvX0Mde5GG3Uzw3BnSRnurx6KFTZ8Qd6hr6+bUpFTqXzFf8fhjbGpm+Kv7JZHi6DacEdjMvUiutYjFAkHk0jScMT1TauOBreHHi8Cr+d6zvSth67wMTOgJckTCioVFFMuFMi0PfbEayFFu/PLVXM51nKeoikZcQJXjuGzFSRxWaR5054CKnqRGR4lL4m5aYpqb+fetqEYdXDQ/Xw0rHnsMjG5OjuWv7vPnEaI4U9/woWM6/fFEKQlN6QIDAQAB",
+  "minimum_chrome_version": "135",
+  "background": { "service_worker": "background.js" },
+  "permissions": ["tabs", "scripting", "debugger", "storage", "alarms", "userScripts", "identity", "identity.email"],
+  "host_permissions": ["<all_urls>"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["capture.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ],
+  "options_page": "options.html",
+  "action": { "default_title": "BrowserLink", "default_popup": "options.html" }
+}
