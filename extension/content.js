@@ -338,7 +338,7 @@
     const h = amount ?? Math.round(innerHeight * 0.8);
     if (direction === 'top') scrollTo(0, 0);
     else if (direction === 'bottom') scrollTo(0, document.documentElement.scrollHeight);
-    else scrollBy({ up: [0, -h], down: [0, h], left: [-h, 0], right: [h, 0] }[direction] || [0, h]);
+    else { const [dx, dy] = { up: [0, -h], down: [0, h], left: [-h, 0], right: [h, 0] }[direction] || [0, h]; scrollBy(dx, dy); }
     return `scrolled ${direction}; now at y=${Math.round(scrollY)} of ${document.documentElement.scrollHeight}`;
   };
 

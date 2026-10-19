@@ -251,17 +251,34 @@ async function act(tabId, doAction) {
 
 // ---------- chrome.debugger (trusted input, background screenshots, eval fallback) ----------
 
-const attached = new Map(); // tabId -> detach timer
+const dbg = new Map(); // tabId -> { attachP, active, idleTimer }
 
 async function cdp(tabId, method, params = {}) {
-  if (!attached.has(tabId)) {
-    await chrome.debugger.attach({ tabId }, '1.3');
-  } else clearTimeout(attached.get(tabId));
-  // Detach after a short idle so Chrome's "started debugging" bar disappears again.
-  attached.set(tabId, setTimeout(() => { chrome.debugger.detach({ tabId }).catch(() => {}); attached.delete(tabId); }, 8000));
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+  let e = dbg.get(tabId);
+  if (!e) { e = { attachP: null, active: 0, idleTimer: null }; dbg.set(tabId, e); }
+  if (e.idleTimer) { clearTimeout(e.idleTimer); e.idleTimer = null; }
+  if (!e.attachP) {
+    e.attachP = chrome.debugger.attach({ tabId }, '1.3').catch(err => {
+      if (/already attached/i.test(String(err?.message || err))) return; // devtools or a prior attach
+      e.attachP = null; // allow a later call to retry
+      throw err;
+    });
+  }
+  await e.attachP;
+  e.active++;
+  try {
+    return await chrome.debugger.sendCommand({ tabId }, method, params);
+  } finally {
+    e.active--;
+    // Detach only once the last in-flight command finishes, so the "started
+    // debugging" bar clears but a long Runtime.evaluate is never cut off.
+    if (e.active <= 0) {
+      e.active = 0;
+      e.idleTimer = setTimeout(() => { chrome.debugger.detach({ tabId }).catch(() => {}); dbg.delete(tabId); }, 8000);
+    }
+  }
 }
-chrome.debugger.onDetach.addListener(src => { clearTimeout(attached.get(src.tabId)); attached.delete(src.tabId); });
+chrome.debugger.onDetach.addListener(src => { const e = dbg.get(src.tabId); if (e?.idleTimer) clearTimeout(e.idleTimer); dbg.delete(src.tabId); });
 
 async function trustedClick(tabId, p) {
   const { frameId, args } = targetArgs(p);
@@ -316,17 +333,46 @@ async function captureScreenshot(tabId, { fullPage = false, maxWidth = 1400 } = 
   return { mimeType: 'image/jpeg', data: btoa(bin), width: canvas.width, height: canvas.height };
 }
 
-function wrapCode(code) {
-  const body = /\breturn\b/.test(code) ? code : `return (${code});`;
+// <evalwrap>
+// Pure helpers, kept self-contained for test/wrapcode.test.mjs.
+// Decide whether code is a statement body (supplies its own `return`) or a
+// single expression to return. Scans at top level only: a `return`, `;` or
+// statement keyword inside a string or a nested function must not count, which
+// is what the old /\breturn\b/ test got wrong.
+function looksLikeBody(code) {
+  const KW = /^(return|const|let|var|throw|if|for|while|switch|try|do|function|class|debugger)\b/;
+  let depth = 0;
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i];
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c; i++;
+      while (i < code.length && code[i] !== q) { if (code[i] === '\\') i++; i++; }
+      continue;
+    }
+    if (c === '/' && code[i + 1] === '/') { while (i < code.length && code[i] !== '\n') i++; continue; }
+    if (c === '/' && code[i + 1] === '*') { i += 2; while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++; i++; continue; }
+    if (c === '{' || c === '(' || c === '[') { depth++; continue; }
+    if (c === '}' || c === ')' || c === ']') { depth--; continue; }
+    if (depth === 0) {
+      if (c === ';') return true;
+      if (/[A-Za-z_$]/.test(c) && (i === 0 || !/[A-Za-z0-9_$]/.test(code[i - 1])) && KW.test(code.slice(i))) return true;
+    }
+  }
+  return false;
+}
+
+function wrapCode(code, asBody) {
+  const body = (asBody === undefined ? looksLikeBody(code) : asBody) ? code : `return (${code}\n);`;
   return `(async () => { const __r = await (async () => { ${body} })();
     if (__r === undefined) return 'undefined';
     try { return JSON.stringify(__r, null, 2); } catch { return String(__r); } })()`;
 }
+// </evalwrap>
 
-async function evaluate(tabId, { code, frameId = 0 }) {
+async function evaluate(tabId, { code, frameId = 0, body }) {
   const tab = await chrome.tabs.get(tabId);
   if (restricted(tab.url)) throw new Error(`Chrome does not let extensions script ${tab.url}`);
-  const wrapped = wrapCode(code);
+  const wrapped = wrapCode(code, body);
   // Preferred: userScripts.execute runs arbitrary code in the page without the debugger bar.
   if (chrome.userScripts?.execute) {
     try {
@@ -466,8 +512,8 @@ const commands = {
     return captureScreenshot(tabId, { fullPage });
   },
 
-  evaluate({ tabId, code, frameId }) {
-    return evaluate(tabId, { code, frameId });
+  evaluate({ tabId, code, frameId, body }) {
+    return evaluate(tabId, { code, frameId, body });
   },
 
   async console({ tabId, clear = false }) {
