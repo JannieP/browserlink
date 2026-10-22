@@ -21,6 +21,15 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
+// Synthetic input only, by default. Trusted/CDP input injects a real OS-level
+// click, which makes Chrome raise the window to the foreground (and on a
+// multi-desktop setup, switch desktops); synthetic DOM events never do. This
+// matches how the agent drives a page without yanking it to the front. Set
+// BROWSERLINK_TRUSTED_INPUT=1 to re-enable trusted input for the rare site that
+// rejects synthetic events (it will foreground the window it acts on).
+const TRUSTED_INPUT = process.env.BROWSERLINK_TRUSTED_INPUT === '1';
+log('input mode:', TRUSTED_INPUT ? 'trusted allowed (may foreground the window)' : 'synthetic only (never raises the window)');
+
 // ---------- config ----------
 
 fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
@@ -150,16 +159,21 @@ function resolvePython() {
 const PYTHON = resolvePython();
 if (DESKTOPS_ENABLED) log('desktops:', PYTHON ? `using ${PYTHON}` : 'disabled (no python3 with pyobjc; set BROWSERLINK_PYTHON)');
 
-let deskCache = { at: 0, data: null };
+let deskCache = { at: 0, data: null, goodAt: 0, good: null };
 function desktops() {
   if (!PYTHON) return Promise.resolve(null);
   if (Date.now() - deskCache.at < 1000) return Promise.resolve(deskCache.data);
   return new Promise(resolve => {
-    execFile(PYTHON, [SPACES_HELPER], { timeout: 1500, maxBuffer: 1 << 20 }, (err, stdout) => {
+    execFile(PYTHON, [SPACES_HELPER], { timeout: 4000, maxBuffer: 1 << 20 }, (err, stdout) => {
       let data = null;
-      if (!err) { try { const j = JSON.parse(stdout); if (j && Array.isArray(j.windows)) data = j; } catch {} }
-      deskCache = { at: Date.now(), data };
-      resolve(data);
+      if (!err) { try { const j = JSON.parse(stdout); if (j && Array.isArray(j.windows) && j.windows.length) data = j; } catch {} }
+      const now = Date.now();
+      // A transient failure (cold python, a busy system, or Chrome mid-reload
+      // momentarily returning no windows) keeps serving the last good reading
+      // for a short grace window, so one blip never blanks every desktop label.
+      if (data) deskCache = { at: now, data, goodAt: now, good: data };
+      else deskCache = { ...deskCache, at: now, data: now - deskCache.goodAt < 30000 ? deskCache.good : null };
+      resolve(deskCache.data);
     });
   });
 }
@@ -207,7 +221,8 @@ async function tabsWithDesktops(s) {
   // an extension that predates the bounds field.
   const extWindows = resp.windows?.length ? resp.windows
     : [...new Set((resp.tabs || []).map(t => t.windowId))].map(id => ({ id }));
-  return { ...resp, windowDesktop: matchDesktops(osData, extWindows, resp.tabs || []), activeSpace: osData?.activeSpace ?? null };
+  const windowDesktop = matchDesktops(osData, extWindows, resp.tabs || []);
+  return { ...resp, windowDesktop, activeSpace: osData?.activeSpace ?? null };
 }
 
 // Accepts "work:123", "123" (searched across sessions) or nothing (focused tab of the most recently focused session).
@@ -346,7 +361,7 @@ const targetArgs = {
   selector: z.string().optional().describe('CSS selector (pierces open shadow roots). Use when there is no ref.'),
   text: z.string().optional().describe('Visible name of the control, e.g. "Sign in". Exact match preferred, else substring.'),
 };
-const trustedArg = z.boolean().optional().describe('Use Chrome\'s debugger to send real (isTrusted) input. Only for sites that ignore synthetic events; briefly shows Chrome\'s "started debugging" bar.');
+const trustedArg = z.boolean().optional().describe('Use Chrome\'s debugger to send real (isTrusted) input. Disabled by default because it foregrounds the window; ignored unless the hub runs with BROWSERLINK_TRUSTED_INPUT=1. Only for sites that ignore synthetic events.');
 
 function tool(mcp, name, description, schema, fn) {
   mcp.registerTool(name, { description, inputSchema: schema }, async args => {
@@ -356,6 +371,9 @@ function tool(mcp, name, description, schema, fn) {
 
 // Call a tab-scoped extension command and prefix the result with the tab handle.
 async function onTab(args, method, params = {}, timeoutMs) {
+  // Unless trusted input is explicitly enabled, never send it: synthetic events
+  // drive the page without foregrounding the window.
+  if (!TRUSTED_INPUT && params && params.trusted) params = { ...params, trusted: false };
   const { s, tabId } = await resolveTab(args.tab, args.session);
   const result = await call(s, method, { tabId, ...params }, timeoutMs);
   return { s, tabId, result, handle: `${s.name}:${tabId}` };
