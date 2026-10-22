@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/hub.test.mjs test/wrapcode.test.mjs"
+    "test": "node --test test/hub.test.mjs test/wrapcode.test.mjs test/desktops.test.mjs"
   },
   "keywords": [],
   "author": "",

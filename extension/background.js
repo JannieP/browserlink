@@ -394,7 +394,10 @@ const commands = {
   async tabs() {
     const [tabs, wins] = await Promise.all([chrome.tabs.query({}), chrome.windows.getAll()]);
     const focused = wins.find(w => w.focused)?.id;
-    return { tabs: tabs.map(tabInfo), focusedWindowId: focused ?? null, lastFocusAt };
+    // Window bounds let the hub match these windows to the OS window list (and
+    // thus to a macOS desktop/Space). Harmless and ignored on other platforms.
+    const windows = wins.map(w => ({ id: w.id, left: w.left, top: w.top, width: w.width, height: w.height, focused: w.focused, state: w.state }));
+    return { tabs: tabs.map(tabInfo), windows, focusedWindowId: focused ?? null, lastFocusAt };
   },
 
   async open({ url = 'about:blank', background = false, newWindow = false }) {

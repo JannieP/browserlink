@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -125,6 +126,90 @@ function sessionFor(name) {
   return [...sessions.values()].sort((a, b) => b.lastFocusAt - a.lastFocusAt)[0];
 }
 
+// ---------- macOS virtual-desktop (Space) awareness ----------
+// On macOS we shell out to a small Python helper that reads each Chrome
+// window's Space (virtual desktop) via the private CoreGraphics API, so the
+// hub can prefer the window on the desktop you're actually looking at instead
+// of whatever was focused last. Everything degrades to "unknown" — a non-mac
+// host, a missing python3, or a future OS change never breaks tab handling.
+const DESKTOPS_ENABLED = process.platform === 'darwin' && process.env.BROWSERLINK_DESKTOPS !== '0';
+const SPACES_HELPER = path.join(ROOT, 'hub', 'macos-spaces.py');
+
+// Find a python3 that can import pyobjc's Quartz. launchd's PATH only has
+// /usr/bin/python3, which usually lacks pyobjc, so probe common locations and
+// let BROWSERLINK_PYTHON override. null => desktop detection stays off.
+function resolvePython() {
+  if (!DESKTOPS_ENABLED) return null;
+  const candidates = [process.env.BROWSERLINK_PYTHON, '/opt/homebrew/bin/python3', 'python3', '/usr/local/bin/python3', '/usr/bin/python3'].filter(Boolean);
+  for (const py of candidates) {
+    try { execFileSync(py, ['-c', 'import Quartz'], { stdio: 'ignore', timeout: 5000 }); return py; }
+    catch { /* try the next candidate */ }
+  }
+  return null;
+}
+const PYTHON = resolvePython();
+if (DESKTOPS_ENABLED) log('desktops:', PYTHON ? `using ${PYTHON}` : 'disabled (no python3 with pyobjc; set BROWSERLINK_PYTHON)');
+
+let deskCache = { at: 0, data: null };
+function desktops() {
+  if (!PYTHON) return Promise.resolve(null);
+  if (Date.now() - deskCache.at < 1000) return Promise.resolve(deskCache.data);
+  return new Promise(resolve => {
+    execFile(PYTHON, [SPACES_HELPER], { timeout: 1500, maxBuffer: 1 << 20 }, (err, stdout) => {
+      let data = null;
+      if (!err) { try { const j = JSON.parse(stdout); if (j && Array.isArray(j.windows)) data = j; } catch {} }
+      deskCache = { at: Date.now(), data };
+      resolve(data);
+    });
+  });
+}
+
+// Match the OS window list to the extension's windows — by active-tab title,
+// then by nearest bounds — giving Map<windowId, {desktop, onActiveDesktop, display}>.
+// <desktopmatch>
+function matchDesktops(osData, extWindows = [], extTabs = []) {
+  const map = new Map();
+  if (!osData?.windows?.length || !extWindows.length) return map;
+  const titleOf = wid => (extTabs.find(t => t.active && t.windowId === wid) || {}).title || '';
+  const used = new Set();
+  const pick = ew => {
+    const title = titleOf(ew.id).trim();
+    if (title) {
+      const hit = osData.windows.find(o => !used.has(o.cgid) && o.title &&
+        (o.title === title || o.title.startsWith(title) || title.startsWith(o.title)));
+      if (hit) return hit;
+    }
+    if (Number.isFinite(ew.left)) {
+      let best = null, bestD = Infinity;
+      for (const o of osData.windows) {
+        if (used.has(o.cgid) || !o.bounds) continue;
+        const d = Math.abs(o.bounds[0] - ew.left) + Math.abs(o.bounds[1] - ew.top) +
+                  Math.abs(o.bounds[2] - ew.width) + Math.abs(o.bounds[3] - ew.height);
+        if (d < bestD) { bestD = d; best = o; }
+      }
+      if (best && bestD < 300) return best;
+    }
+    return null;
+  };
+  for (const ew of extWindows) {
+    const o = pick(ew);
+    if (o) { used.add(o.cgid); map.set(ew.id, { desktop: o.desktop ?? null, onActiveDesktop: !!o.onActiveDesktop, display: o.display ?? null }); }
+  }
+  return map;
+}
+// </desktopmatch>
+
+// 'tabs' from a session, enriched with desktop info when it can be determined.
+async function tabsWithDesktops(s) {
+  const [resp, osData] = await Promise.all([call(s, 'tabs'), desktops()]);
+  // Use window bounds when the extension sent them; otherwise fall back to a
+  // window list synthesized from the tabs, so title matching still works with
+  // an extension that predates the bounds field.
+  const extWindows = resp.windows?.length ? resp.windows
+    : [...new Set((resp.tabs || []).map(t => t.windowId))].map(id => ({ id }));
+  return { ...resp, windowDesktop: matchDesktops(osData, extWindows, resp.tabs || []), activeSpace: osData?.activeSpace ?? null };
+}
+
 // Accepts "work:123", "123" (searched across sessions) or nothing (focused tab of the most recently focused session).
 async function resolveTab(tab, session) {
   if (tab && String(tab).includes(':')) {
@@ -144,8 +229,18 @@ async function resolveTab(tab, session) {
     return { s: matches[0], tabId: id };
   }
   const s = sessionFor(session);
-  const { tabs, focusedWindowId } = await call(s, 'tabs');
-  const t = tabs.find(t => t.active && t.windowId === focusedWindowId) || tabs.find(t => t.active);
+  const { tabs, focusedWindowId, windowDesktop } = await tabsWithDesktops(s);
+  // Prefer the active tab of a window on the current macOS desktop, so an
+  // action doesn't land on a window sitting on another desktop. Fall back to
+  // the most recently focused window, then to any active tab.
+  const onDesk = wid => windowDesktop.get(wid)?.onActiveDesktop;
+  const anyOnDesk = [...windowDesktop.values()].some(d => d.onActiveDesktop);
+  let t = null;
+  if (anyOnDesk) {
+    if (focusedWindowId != null && onDesk(focusedWindowId)) t = tabs.find(x => x.active && x.windowId === focusedWindowId);
+    if (!t) t = tabs.find(x => x.active && onDesk(x.windowId));
+  }
+  if (!t) t = tabs.find(x => x.active && x.windowId === focusedWindowId) || tabs.find(x => x.active);
   if (!t) throw new Error(`session ${s.name} has no open tabs`);
   return { s, tabId: t.id };
 }
@@ -244,7 +339,7 @@ wss.on('connection', ws => {
 const text = t => ({ content: [{ type: 'text', text: typeof t === 'string' ? t : JSON.stringify(t, null, 2) }] });
 const fail = e => ({ content: [{ type: 'text', text: `Error: ${e.message || e}` }], isError: true });
 
-const tabArg = z.string().optional().describe('Tab handle like "work:1234" (from list_tabs). Omit to use the active tab of the most recently focused browser window.');
+const tabArg = z.string().optional().describe('Tab handle like "work:1234" (from list_tabs). Omit to use the active tab of a window on your current macOS desktop (falling back to the most recently focused window).');
 const sessionArg = z.string().optional().describe('Session name (see list_sessions). Only needed when tab is omitted or is a bare number.');
 const targetArgs = {
   ref: z.string().optional().describe('Element ref from snapshot, e.g. "e12" or "f5:e3" for an iframe.'),
@@ -316,18 +411,45 @@ function buildMcp() {
   }, async ({ session, query }) => {
     const out = [];
     for (const s of session ? [sessionFor(session)] : sessions.values()) {
-      const { tabs, focusedWindowId } = await call(s, 'tabs');
+      const { tabs, focusedWindowId, windowDesktop } = await tabsWithDesktops(s);
       const q = query?.toLowerCase();
       const shown = tabs.filter(t => !q || `${t.title} ${t.url}`.toLowerCase().includes(q));
       out.push(`## ${s.name} (${s.info.email || 'not signed in'})`);
       let win = null;
       for (const t of shown.sort((a, b) => a.windowId - b.windowId)) {
-        if (t.windowId !== win) { win = t.windowId; out.push(`window ${win}${win === focusedWindowId ? ' (focused)' : ''}`); }
+        if (t.windowId !== win) {
+          win = t.windowId;
+          const d = windowDesktop.get(win);
+          let tag = '';
+          if (d?.desktop != null) tag += ` · desktop ${d.desktop}`;
+          if (d?.onActiveDesktop) tag += ' (current)';
+          out.push(`window ${win}${tag}${win === focusedWindowId ? ' (focused)' : ''}`);
+        }
         out.push(`  ${s.name}:${t.id}${t.active ? ' *' : ''} ${t.title || '(untitled)'} — ${t.url}`);
       }
       if (!shown.length) out.push('  (no matching tabs)');
     }
     return text(out.join('\n') || 'no sessions connected');
+  });
+
+  tool(mcp, 'current_desktop', 'List only the tabs whose window is on the macOS desktop (Space) you are looking at right now. On a multi-desktop setup this shows what is in front of you, which is also where tab-less actions are sent by default. macOS only.', {
+    session: z.string().optional().describe('Limit to one session'),
+  }, async ({ session }) => {
+    if (!DESKTOPS_ENABLED) return text('Desktop detection is only available on macOS.');
+    if (!PYTHON) return text('Desktop detection needs python3 with pyobjc (Quartz). Install it with `pip3 install pyobjc-framework-Quartz`, or set BROWSERLINK_PYTHON to a python that has it.');
+    const out = [];
+    for (const s of session ? [sessionFor(session)] : sessions.values()) {
+      const { tabs, windowDesktop } = await tabsWithDesktops(s);
+      const here = tabs.filter(t => windowDesktop.get(t.windowId)?.onActiveDesktop);
+      if (!here.length) continue;
+      out.push(`## ${s.name} (${s.info.email || 'not signed in'})`);
+      let win = null;
+      for (const t of here.sort((a, b) => a.windowId - b.windowId)) {
+        if (t.windowId !== win) { win = t.windowId; const d = windowDesktop.get(win); out.push(`window ${win}${d?.desktop != null ? ` · desktop ${d.desktop}` : ''}`); }
+        out.push(`  ${s.name}:${t.id}${t.active ? ' *' : ''} ${t.title || '(untitled)'} — ${t.url}`);
+      }
+    }
+    return text(out.join('\n') || 'No Chrome window is on the current desktop (or desktop info is unavailable right now).');
   });
 
   tool(mcp, 'open_tab', 'Open a new tab (or window) in a session.', {

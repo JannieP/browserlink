@@ -39,6 +39,7 @@ export async function startHub() {
       BROWSERLINK_PORT: String(port),
       BROWSERLINK_CONFIG_DIR: configDir,
       BROWSERLINK_CHROME_DIR: path.join(configDir, 'no-chrome-here'), // nonexistent -> no profiles
+      BROWSERLINK_DESKTOPS: '0', // don't shell out to the macOS Spaces helper during tests
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
